@@ -4,7 +4,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler, MaxAbsScaler
-import math
+import geopandas as gpd
+import contextily as ctx
+
+from sklearn.cluster import DBSCAN
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
 
 st.sidebar.markdown("### Preprocesare Date")
 metoda_extreme = st.sidebar.selectbox("Tratament valori extreme",
@@ -158,6 +164,8 @@ sns.histplot(df["fare_amount"], bins=50, kde=True, ax=ax)
 ax.set_xlabel("Tarif")
 ax.set_ylabel("Frecvență")
 st.pyplot(fig)
+st.markdown(
+    "**Interpretare:** Majoritatea curselor au tarife mici intre 5-20 USD. Distributia este asimetrica cu valori extreme peste 50 USD, probabil curse lungi sau la ore de varf.")
 
 st.subheader("Tendințe în Funcție de Timp")
 fig, ax = plt.subplots()
@@ -165,6 +173,8 @@ sns.boxplot(x=df["categorie_timp"], y=df["fare_amount"], ax=ax)
 ax.set_xlabel("Categorie de timp")
 ax.set_ylabel("Tarif")
 st.pyplot(fig)
+st.markdown(
+    "**Interpretare:** Tarifele sunt mai mari noaptea si seara. Orele de varf probabil duc la tarife mai ridicate datorita cererii crescute.")
 
 st.subheader("Relația dintre Numărul de Pasageri și Tarif")
 fig, ax = plt.subplots()
@@ -172,6 +182,8 @@ sns.boxplot(x=df["passenger_count"], y=df["fare_amount"], ax=ax)
 ax.set_xlabel("Număr de pasageri")
 ax.set_ylabel("Tarif")
 st.pyplot(fig)
+st.markdown(
+    "**Interpretare:** Nu exista o corelatie clara intre numarul de pasageri si tarif. Cursele cu 1-2 pasageri sunt predominante.")
 
 st.subheader("Relația dintre Distanță și Tarif")
 fig, ax = plt.subplots()
@@ -179,6 +191,8 @@ sns.scatterplot(x=df["distanta_km"], y=df["fare_amount"], hue=df["outlier_tarif"
 ax.set_xlabel("Distanță (km)")
 ax.set_ylabel("Tarif")
 st.pyplot(fig)
+st.markdown(
+    "**Interpretare:** Relatie aproximativ liniara intre distanta si tarif. Valorile extreme (rosii) reprezinta probabil curse cu tarife nejustificate pentru distanta parcursa.")
 
 st.subheader("Tarif Mediu pe Zi a Săptămânii")
 fig, ax = plt.subplots()
@@ -186,6 +200,8 @@ sns.barplot(x=agregare_zi["zi_saptamana"], y=agregare_zi["fare_amount"], ax=ax)
 ax.set_xlabel("Zi a săptămânii (0 = Luni, 6 = Duminică)")
 ax.set_ylabel("Tarif mediu")
 st.pyplot(fig)
+st.markdown(
+    "**Interpretare:** Tarifele sunt putin mai mari in mijlocul saptamanii.")
 
 st.subheader("Distanța Medie pe An")
 fig, ax = plt.subplots()
@@ -193,6 +209,8 @@ sns.lineplot(x=agregare_an["an"], y=agregare_an["distanta_km"], marker='o', ax=a
 ax.set_xlabel("An")
 ax.set_ylabel("Distanță medie (km)")
 st.pyplot(fig)
+st.markdown(
+    "**Interpretare:** Distanta medie a curselor scade usor in timp, posibil datorita cresterii numarului de curse scurte in oras.")
 
 st.subheader("Tarif Mediu în Funcție de Numărul de Pasageri")
 fig, ax = plt.subplots()
@@ -200,6 +218,8 @@ sns.barplot(x=agregare_pasageri["passenger_count"], y=agregare_pasageri["fare_am
 ax.set_xlabel("Număr de pasageri")
 ax.set_ylabel("Tarif mediu")
 st.pyplot(fig)
+st.markdown(
+    "**Interpretare:** Cursele cu mai mult de un pasager tind sa fie putin mai scumpe.")
 
 if aplica_indicator_evenimente:
     st.subheader("Tarif Mediu în Funcție de Evenimente Speciale")
@@ -209,6 +229,8 @@ if aplica_indicator_evenimente:
     ax.set_xlabel("Eveniment special")
     ax.set_ylabel("Tarif mediu")
     st.pyplot(fig)
+    st.markdown(
+        "**Interpretare:** Evenimentele precum Revelion sau Halloween au tarife medii mai mari datorita cererii crescute si a tarifelor dinamice.")
 
 if aplica_codificare_ciclică:
     st.subheader("Analiza Ciclică a Tarifelor")
@@ -240,5 +262,144 @@ if aplica_codificare_ciclică:
     fig.legend(loc='upper right')
     st.pyplot(fig)
 
+st.subheader("Harti Locatii Populare")
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+gdf_pickup = gpd.GeoDataFrame(
+    df,
+    geometry=gpd.points_from_xy(df.pickup_longitude, df.pickup_latitude),
+    crs='EPSG:4326'
+).to_crs(epsg=3857)
+
+gdf_pickup.plot(ax=ax1, markersize=0.1, alpha=0.5, color='blue')
+ctx.add_basemap(ax1, source=ctx.providers.CartoDB.Positron)
+ax1.set_title('Locatii Populare de Ridicare')
+ax1.set_axis_off()
+
+gdf_dropoff = gpd.GeoDataFrame(
+    df,
+    geometry=gpd.points_from_xy(df.dropoff_longitude, df.dropoff_latitude),
+    crs='EPSG:4326'
+).to_crs(epsg=3857)
+
+gdf_dropoff.plot(ax=ax2, markersize=0.1, alpha=0.5, color='red')
+ctx.add_basemap(ax2, source=ctx.providers.CartoDB.Positron)
+ax2.set_title('Locatii Populare de Lasare')
+ax2.set_axis_off()
+
+st.pyplot(fig)
+st.markdown(
+    "**Interpretare Ridicari:** Concentratia ridicarilor este mai mare in zone centrale precum aeroporturi si zone comerciale. Activitatea este intensa in zona Manhattan.")
+st.markdown(
+    "**Interpretare Lasari:** Zonele de lasare coincid partial cu cele de ridicare, cu distributie similara, sugerand cerere concentrata in aceleasi zone urbane.")
+
+
+# ====================
+# 1) CLUSTERIZARE GEOGRAFICĂ (pickup-hotspots)
+# ====================
+# după calculul coloanei 'distanta_km', imediat înainte de secțiunile de vizualizare:
+
+# 1.a. Convertim coordonatele într-un array (lat/lon în radiani)
+coords = df[['pickup_latitude', 'pickup_longitude']].to_numpy()
+coords_rad = np.radians(coords)
+
+# 1.b. Definim DBSCAN cu distanță maximă de 0.5 km și min_samples=50
+kms_per_radian = 6371.0088
+epsilon = 0.5 / kms_per_radian
+db = DBSCAN(eps=epsilon, min_samples=50, algorithm='ball_tree', metric='haversine')
+labels = db.fit_predict(coords_rad)
+
+df['pickup_cluster'] = labels
+num_clusters = len(set(labels) - {-1})
+st.markdown(f"**Hotspots pickup identificate:** {num_clusters} clustere.")
+
+# 1.c. Vizualizare pe hartă
+if st.checkbox("Arată pickup-hotspots pe hartă", value=False):
+    # filtrăm doar punctele care nu fac parte din zgomot (label != -1)
+    df_pick_clusters = df[df['pickup_cluster'] != -1].copy()
+    gdf_pick = gpd.GeoDataFrame(
+        df_pick_clusters,
+        geometry=gpd.points_from_xy(
+            df_pick_clusters['pickup_longitude'],
+            df_pick_clusters['pickup_latitude']
+        ),
+        crs='EPSG:4326'
+    ).to_crs(epsg=3857)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    gdf_pick.plot(
+        ax=ax,
+        column='pickup_cluster',
+        categorical=True,
+        legend=True,
+        markersize=5,
+        alpha=0.6
+    )
+    ctx.add_basemap(ax, source=ctx.providers.CartoDB.Positron)
+    ax.set_axis_off()
+    st.pyplot(fig)
+
+# ====================
+# 2) REGRESIE: PREDICȚIA TARIFULUI
+# ====================
+# după secțiunea de încărcare df și înainte de afișarea preview-ului:
+
+# 2.a. Pregătire set de date pentru regresie
+# selectăm doar rândurile fără valori extreme marcate drept outlier_tarif
+df_reg = df[~df['outlier_tarif']].copy()
+
+# definim feature-urile
+features = ['distanta_km', 'ora_sin', 'ora_cos', 'zi_sin', 'zi_cos', 'passenger_count']
+if 'eveniment_special' in df_reg.columns:
+    # codificăm categorical
+    df_reg = pd.get_dummies(df_reg, columns=['eveniment_special'], drop_first=True)
+    features += [c for c in df_reg.columns if c.startswith('eveniment_special_')]
+
+X = df_reg[features]
+y = df_reg['fare_amount']
+
+# 2.b. Split train/test
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# 2.c. Antrenare model
+rf = RandomForestRegressor(n_estimators=100, random_state=42)
+rf.fit(X_train, y_train)
+
+# 2.d. Evaluare model
+y_pred = rf.predict(X_test)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+st.markdown(f"**Regresie RF:** RMSE pe test set = {rmse:.3f}")
+
+# 2.e. Interfață Streamlit pentru predicții
+st.sidebar.markdown("### Predictie Tarif")
+input_dist = st.sidebar.number_input("Distanță (km)", min_value=0.0, value=1.0)
+input_hour = st.sidebar.slider("Ora zilei", 0, 23, 12)
+input_pass = st.sidebar.number_input("Număr pasageri", min_value=1, max_value=6, value=1)
+
+# calcul cyclic
+sin_h = np.sin(2 * np.pi * input_hour / 24)
+cos_h = np.cos(2 * np.pi * input_hour / 24)
+# ziua saptamanii asumata neutra (0=Luni)
+sin_d = 0.0
+cos_d = 1.0
+
+# construire vector de input
+user_feat = {
+    'distanta_km': input_dist,
+    'ora_sin': sin_h,
+    'ora_cos': cos_h,
+    'zi_sin': sin_d,
+    'zi_cos': cos_d,
+    'passenger_count': input_pass
+}
+# completam eveniment_special_dummies cu 0 daca este cazul
+for f in features:
+    if f not in user_feat:
+        user_feat[f] = 0.0
+
+df_user = pd.DataFrame([user_feat])
+
+if st.sidebar.button("Calculează tarif estimat"):
+    pred = rf.predict(df_user[features])[0]
+    st.sidebar.success(f"Tarif estimat: {pred:.2f}")
 st.markdown(
     "Aplicația utilizează Streamlit pentru afișare și analize diverse, împreună cu pandas pentru prelucrarea datelor și Matplotlib/Seaborn pentru reprezentările grafice.")
