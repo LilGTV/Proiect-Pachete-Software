@@ -338,68 +338,91 @@ if st.checkbox("Arată pickup-hotspots pe hartă", value=False):
     ax.set_axis_off()
     st.pyplot(fig)
 
+
+from sklearn.linear_model import LinearRegression
+import pickle
+import os
 # ====================
 # 2) REGRESIE: PREDICȚIA TARIFULUI
 # ====================
-# după secțiunea de încărcare df și înainte de afișarea preview-ului:
+# Încărcare date
+# === Sidebar: configurare regresie ===
+# === 1) Preprocesare și definire caracteristici ===
+df_reg = df[~df["outlier_tarif"]].copy()
+df_reg["ora"]         = df_reg["pickup_datetime"].dt.hour
+df_reg["zi_saptamana"]= df_reg["pickup_datetime"].dt.dayofweek
+df_reg["ora_sin"]     = np.sin(2 * np.pi * df_reg["ora"] / 24)
+df_reg["ora_cos"]     = np.cos(2 * np.pi * df_reg["ora"] / 24)
+df_reg["zi_sin"]      = np.sin(2 * np.pi * df_reg["zi_saptamana"] / 7)
+df_reg["zi_cos"]      = np.cos(2 * np.pi * df_reg["zi_saptamana"] / 7)
 
-# 2.a. Pregătire set de date pentru regresie
-# selectăm doar rândurile fără valori extreme marcate drept outlier_tarif
-df_reg = df[~df['outlier_tarif']].copy()
-
-# definim feature-urile
-features = ['distanta_km', 'ora_sin', 'ora_cos', 'zi_sin', 'zi_cos', 'passenger_count']
-if 'eveniment_special' in df_reg.columns:
-    # codificăm categorical
-    df_reg = pd.get_dummies(df_reg, columns=['eveniment_special'], drop_first=True)
-    features += [c for c in df_reg.columns if c.startswith('eveniment_special_')]
+# Lista de caracteristici de bază
+features = ["distanta_km", "ora_sin", "ora_cos", "zi_sin", "zi_cos", "passenger_count"]
+# One-hot encoding pentru eveniment_special
+if "eveniment_special" in df_reg.columns:
+    df_reg = pd.get_dummies(df_reg, columns=["eveniment_special"], drop_first=True)
+    ev_cols = [c for c in df_reg.columns if c.startswith("eveniment_special_")]
+    features += ev_cols
 
 X = df_reg[features]
-y = df_reg['fare_amount']
+y = df_reg["fare_amount"]
 
-# 2.b. Split train/test
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# === 2) Sidebar și persistență model ===
+st.sidebar.markdown("## Regresie Tarif Uber")
+retrain = st.sidebar.button("Începe regresia")
+model_path = "model_rf.pkl"
 
-# 2.c. Antrenare model
-rf = RandomForestRegressor(n_estimators=100, random_state=42)
-rf.fit(X_train, y_train)
+if os.path.exists(model_path) and not retrain:
+    # Încarcă modelul existent
+    with open(model_path, "rb") as f:
+        lr = pickle.load(f)
+    st.sidebar.success("Model LinearRegression încărcat din disk.")
+else:
+    # Split train/test
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+    # Antrenare
+    lr = LinearRegression()
+    lr.fit(X_train, y_train)
+    # Evaluare
+    y_pred = lr.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    st.sidebar.write(f"RMSE pe test set: {rmse:.3f}")
+    # Salvare model
+    with open(model_path, "wb") as f:
+        pickle.dump(lr, f)
+    st.sidebar.success(f"Model antrenat și salvat în '{model_path}'")
 
-# 2.d. Evaluare model
-y_pred = rf.predict(X_test)
-rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-st.markdown(f"**Regresie RF:** RMSE pe test set = {rmse:.3f}")
+# === 3) Interfața de predicție ===
+st.sidebar.markdown("### Predicție Tarif")
+input_dist  = st.sidebar.number_input("Distanță (km)",    min_value=0.0, value=1.0, step=0.1)
+input_hour  = st.sidebar.slider("Ora zilei",             0, 23, 12)
+input_pass  = st.sidebar.number_input("Număr pasageri",   1, 6, 1)
+# Pentru simplitate, presupunem Luni (0)
+input_day   = 0
 
-# 2.e. Interfață Streamlit pentru predicții
-st.sidebar.markdown("### Predictie Tarif")
-input_dist = st.sidebar.number_input("Distanță (km)", min_value=0.0, value=1.0)
-input_hour = st.sidebar.slider("Ora zilei", 0, 23, 12)
-input_pass = st.sidebar.number_input("Număr pasageri", min_value=1, max_value=6, value=1)
-
-# calcul cyclic
+# Codificare ciclică pentru input
 sin_h = np.sin(2 * np.pi * input_hour / 24)
 cos_h = np.cos(2 * np.pi * input_hour / 24)
-# ziua saptamanii asumata neutra (0=Luni)
-sin_d = 0.0
-cos_d = 1.0
+sin_d = np.sin(2 * np.pi * input_day   / 7)
+cos_d = np.cos(2 * np.pi * input_day   / 7)
 
-# construire vector de input
-user_feat = {
-    'distanta_km': input_dist,
-    'ora_sin': sin_h,
-    'ora_cos': cos_h,
-    'zi_sin': sin_d,
-    'zi_cos': cos_d,
-    'passenger_count': input_pass
-}
-# completam eveniment_special_dummies cu 0 daca este cazul
-for f in features:
-    if f not in user_feat:
-        user_feat[f] = 0.0
+# Construim DataFrame-ul de intrare
+df_user = pd.DataFrame([{
+    "distanta_km":    input_dist,
+    "ora_sin":        sin_h,
+    "ora_cos":        cos_h,
+    "zi_sin":         sin_d,
+    "zi_cos":         cos_d,
+    "passenger_count": input_pass
+}])
 
-df_user = pd.DataFrame([user_feat])
+# Ne asigurăm că avem exact coloanele din features
+df_user = df_user.reindex(columns=features, fill_value=0.0)
 
 if st.sidebar.button("Calculează tarif estimat"):
-    pred = rf.predict(df_user[features])[0]
-    st.sidebar.success(f"Tarif estimat: {pred:.2f}")
+    pred = lr.predict(df_user)[0]
+    st.sidebar.success(f"Tarif estimat: {pred:.2f} USD")
 st.markdown(
     "Aplicația utilizează Streamlit pentru afișare și analize diverse, împreună cu pandas pentru prelucrarea datelor și Matplotlib/Seaborn pentru reprezentările grafice.")
