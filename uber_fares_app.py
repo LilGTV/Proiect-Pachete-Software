@@ -10,7 +10,6 @@ from joblib import Parallel, delayed
 
 from sklearn.cluster import DBSCAN
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import SGDRegressor
 from sklearn.metrics import mean_squared_error
 import pickle
 import os
@@ -368,7 +367,7 @@ with st.expander("Clusterizare Geografică", expanded=False):
     st.subheader("Clusterizare Geografică")
 
     # Eșantion pentru clusterizare
-    eșantion_cluster = df.sample(min(20000, len(df)), random_state=42)
+    eșantion_cluster = df.sample(min(100000, len(df)), random_state=42)
 
     # 1.a. Convertim coordonatele
     coords = eșantion_cluster[['pickup_latitude', 'pickup_longitude']].to_numpy()
