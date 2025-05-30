@@ -6,12 +6,18 @@ import seaborn as sns
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler, MaxAbsScaler
 import geopandas as gpd
 import contextily as ctx
+from joblib import Parallel, delayed
 
 from sklearn.cluster import DBSCAN
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import SGDRegressor
 from sklearn.metrics import mean_squared_error
+import pickle
+import os
 
+# ========================================
+# Secțiunea Sidebar
+# ========================================
 st.sidebar.markdown("### Preprocesare Date")
 metoda_extreme = st.sidebar.selectbox("Tratament valori extreme",
                                       ["Nicio acțiune", "Eliminare IQR", "Winsorizare", "Transformare logaritmică"])
@@ -27,52 +33,82 @@ coloane_scalare = st.sidebar.multiselect("Coloane de scalat",
                                           "dropoff_longitude", "dropoff_latitude"])
 
 
+# ========================================
+# Încărcare și preprocesare date
+# ========================================
 @st.cache_data
-def incarca_date(metoda_extreme, aplica_binning_timp, aplica_codificare_ciclică, aplica_indicator_evenimente,
-                 metoda_scalare, coloane_scalare):
-    df = pd.read_csv("uber.csv", parse_dates=['pickup_datetime'])
+def incarca_date_brute():
+    """Încarcă datele brute cu tipuri optimizate de date"""
+    dtypes = {
+        'fare_amount': 'float32',
+        'pickup_longitude': 'float32',
+        'pickup_latitude': 'float32',
+        'dropoff_longitude': 'float32',
+        'dropoff_latitude': 'float32',
+        'passenger_count': 'int8'
+    }
+    df = pd.read_csv("uber.csv", parse_dates=['pickup_datetime'], dtype=dtypes)
 
-    st.subheader("Valori lipsă înainte de prelucrare")
-    st.write(df.isnull().sum()[df.isnull().sum() > 0])
+    # Elimină valorile lipsă
     df.dropna(inplace=True)
 
+    # Calculează distanța folosind vectorizare
+    coords = df[['pickup_latitude', 'pickup_longitude',
+                 'dropoff_latitude', 'dropoff_longitude']].astype('float32').values
+    R = 6371
+    dlat = np.radians(coords[:, 2] - coords[:, 0])
+    dlon = np.radians(coords[:, 3] - coords[:, 1])
+    a = np.sin(dlat / 2) ** 2 + np.cos(np.radians(coords[:, 0])) * np.cos(np.radians(coords[:, 2])) * np.sin(
+        dlon / 2) ** 2
+    df["distanta_km"] = R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+    # Extrage caracteristici temporale
+    df["ora"] = df["pickup_datetime"].dt.hour
+    df["zi_saptamana"] = df["pickup_datetime"].dt.dayofweek
+    df["an"] = df["pickup_datetime"].dt.year
+
+    return df
+
+
+@st.cache_data
+def preproceseaza_date(df, metoda_extreme, aplica_binning_timp, aplica_codificare_ciclică,
+                       aplica_indicator_evenimente, metoda_scalare, coloane_scalare):
+    """Preprocesează datele cu opțiunile selectate de utilizator"""
+
+    # Funcție pentru calcul IQR (folosită în paralel)
     def calculeaza_iqr(col):
         Q1 = df[col].quantile(0.25)
         Q3 = df[col].quantile(0.75)
         IQR = Q3 - Q1
         return Q1 - 1.5 * IQR, Q3 + 1.5 * IQR
 
-    coloane_verificare = ["fare_amount", "passenger_count", "pickup_longitude", "pickup_latitude", "dropoff_longitude",
-                          "dropoff_latitude"]
+    coloane_verificare = ["fare_amount", "passenger_count", "pickup_longitude", "pickup_latitude",
+                          "dropoff_longitude", "dropoff_latitude"]
 
+    # Procesare valori extreme în paralel
     if metoda_extreme == "Eliminare IQR":
-        total_outlieri = 0
-        nr_total_valori = df.shape[0] * len(coloane_verificare)
-        for col in coloane_verificare:
-            lower, upper = calculeaza_iqr(col)
-            outlieri = df[(df[col] < lower) | (df[col] > upper)].shape[0]
-            total_outlieri += outlieri
-            df = df[(df[col] >= lower) & (df[col] <= upper)]
-        st.markdown(f"**Eliminare IQR:** S-au identificat {total_outlieri} outlieri din {nr_total_valori} valori.")
+        rezultate = Parallel(n_jobs=4)(delayed(calculeaza_iqr)(col) for col in coloane_verificare)
+        masca_totala = pd.Series(True, index=df.index)
+
+        for col, (lower, upper) in zip(coloane_verificare, rezultate):
+            masca_coloana = (df[col] >= lower) & (df[col] <= upper)
+            masca_totala &= masca_coloana
+
+        df = df[masca_totala]
+        st.markdown(f"**Eliminare IQR:** S-au eliminat {len(masca_totala) - masca_totala.sum()} înregistrări.")
+
     elif metoda_extreme == "Winsorizare":
-        total_inlocuite = 0
-        for col in coloane_verificare:
-            lower, upper = calculeaza_iqr(col)
-            inlocuite = df[(df[col] < lower) | (df[col] > upper)].shape[0]
-            total_inlocuite += inlocuite
+        rezultate = Parallel(n_jobs=4)(delayed(calculeaza_iqr)(col) for col in coloane_verificare)
+        for col, (lower, upper) in zip(coloane_verificare, rezultate):
             df[col] = df[col].clip(lower, upper)
-        st.markdown(f"**Winsorizare:** S-au înlocuit {total_inlocuite} valori extreme.")
+        st.markdown("**Winsorizare:** S-au limitat valorile extreme.")
+
     elif metoda_extreme == "Transformare logaritmică":
         df = df[df["fare_amount"] > 0.01]
         df["fare_amount"] = np.log1p(df["fare_amount"])
-        st.markdown("**Transformare logaritmică:** S-a aplicat transformarea log1p pe fare_amount.")
-    else:
-        st.markdown("**Niciun tratament pentru valori extreme aplicat.**")
+        st.markdown("**Transformare logaritmică:** S-a aplicat log1p pe fare_amount.")
 
-    df["ora"] = df["pickup_datetime"].dt.hour
-    df["zi_saptamana"] = df["pickup_datetime"].dt.dayofweek
-    df["an"] = df["pickup_datetime"].dt.year
-
+    # Binning timp
     if aplica_binning_timp:
         bins = [0, 6, 12, 18, 24]
         etichete = ["Noapte", "Dimineață", "Prânz", "Seară"]
@@ -80,12 +116,14 @@ def incarca_date(metoda_extreme, aplica_binning_timp, aplica_codificare_ciclică
     else:
         df["categorie_timp"] = df["ora"]
 
+    # Codificare ciclică
     if aplica_codificare_ciclică:
         df["ora_sin"] = np.sin(2 * np.pi * df["ora"] / 24)
         df["ora_cos"] = np.cos(2 * np.pi * df["ora"] / 24)
         df["zi_sin"] = np.sin(2 * np.pi * df["zi_saptamana"] / 7)
         df["zi_cos"] = np.cos(2 * np.pi * df["zi_saptamana"] / 7)
 
+    # Indicator evenimente speciale
     if aplica_indicator_evenimente:
         evenimente = {
             "Crăciun": (12, 25),
@@ -102,6 +140,7 @@ def incarca_date(metoda_extreme, aplica_binning_timp, aplica_codificare_ciclică
 
         df["eveniment_special"] = df["pickup_datetime"].apply(verifica_eveniment)
 
+    # Scalare caracteristici
     if metoda_scalare != "Nicio scalare" and coloane_scalare:
         if metoda_scalare == "MinMax":
             scaler = MinMaxScaler()
@@ -111,52 +150,68 @@ def incarca_date(metoda_extreme, aplica_binning_timp, aplica_codificare_ciclică
             scaler = RobustScaler()
         elif metoda_scalare == "MaxAbs":
             scaler = MaxAbsScaler()
+
         df[coloane_scalare] = scaler.fit_transform(df[coloane_scalare])
 
-    def haversine(lon1, lat1, lon2, lat2):
-        R = 6371
-        phi1 = np.radians(lat1)
-        phi2 = np.radians(lat2)
-        delta_phi = np.radians(lat2 - lat1)
-        delta_lambda = np.radians(lon2 - lon1)
-        a = np.sin(delta_phi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(delta_lambda / 2.0) ** 2
-        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-        return R * c
-
-    df["distanta_km"] = haversine(df["pickup_longitude"], df["pickup_latitude"], df["dropoff_longitude"],
-                                  df["dropoff_latitude"])
-
+    # Calculează tarif pe km
     df["tarif_per_km"] = df["fare_amount"] / (df["distanta_km"] + 1e-6)
     media_tarif = df["tarif_per_km"].mean()
     std_tarif = df["tarif_per_km"].std()
     prag = media_tarif + 2 * std_tarif
     df["outlier_tarif"] = df["tarif_per_km"] > prag
 
+    return df
+
+
+@st.cache_data
+def calculeaza_agregari(df, aplica_binning_timp):
+    """Calculează agregările pentru vizualizări"""
     if aplica_binning_timp:
         agregare_timp = df.groupby("categorie_timp")["fare_amount"].mean().reset_index()
     else:
         agregare_timp = df.groupby("ora")["fare_amount"].mean().reset_index()
+
     agregare_zi = df.groupby("zi_saptamana")["fare_amount"].mean().reset_index()
     agregare_an = df.groupby("an")["distanta_km"].mean().reset_index()
     agregare_pasageri = df.groupby("passenger_count")["fare_amount"].mean().reset_index()
 
-    return df, agregare_timp, agregare_zi, agregare_an, agregare_pasageri
+    return agregare_timp, agregare_zi, agregare_an, agregare_pasageri
 
 
-df, agregare_timp, agregare_zi, agregare_an, agregare_pasageri = incarca_date(metoda_extreme, aplica_binning_timp,
-                                                                              aplica_codificare_ciclică,
-                                                                              aplica_indicator_evenimente,
-                                                                              metoda_scalare, coloane_scalare)
+# Încărcare date brute
+df_brut = incarca_date_brute()
 
+# Preprocesare date
+df = preproceseaza_date(
+    df_brut,
+    metoda_extreme,
+    aplica_binning_timp,
+    aplica_codificare_ciclică,
+    aplica_indicator_evenimente,
+    metoda_scalare,
+    coloane_scalare
+)
+
+# Calculează agregări
+agregare_timp, agregare_zi, agregare_an, agregare_pasageri = calculeaza_agregari(df, aplica_binning_timp)
+
+# Eșantion pentru vizualizări grele
+eșantion_viz = df.sample(min(10000, len(df)), random_state=42) if len(df) > 10000 else df
+
+# ========================================
+# Interfața principală
+# ========================================
 st.title("Analiza Tarifelor Uber")
 st.markdown(
     "Această aplicație prelucrează și analizează datele curselor Uber utilizând Streamlit, pandas și diverse tehnici de prelucrare a datelor.")
 
-st.subheader("Preview Date")
-st.write(df.head())
+with st.expander("Preview Date", expanded=False):
+    st.subheader("Preview Date")
+    st.write(df.head())
 
-st.subheader("Statistici Descriptive")
-st.write(df.describe())
+with st.expander("Statistici Descriptive", expanded=False):
+    st.subheader("Statistici Descriptive")
+    st.write(df.describe())
 
 st.subheader("Distribuția Tarifelor")
 fig, ax = plt.subplots()
@@ -165,7 +220,7 @@ ax.set_xlabel("Tarif")
 ax.set_ylabel("Frecvență")
 st.pyplot(fig)
 st.markdown(
-    "**Interpretare:** Majoritatea curselor au tarife mici intre 5-20 USD. Distributia este asimetrica cu valori extreme peste 50 USD, probabil curse lungi sau la ore de varf.")
+    "**Interpretare:** Majoritatea curselor au tarife mici intre 4-10 USD. Distributia este asimetrica cu valori extreme peste 12 USD, probabil curse lungi sau la ore de varf.")
 
 st.subheader("Tendințe în Funcție de Timp")
 fig, ax = plt.subplots()
@@ -173,8 +228,10 @@ sns.boxplot(x=df["categorie_timp"], y=df["fare_amount"], ax=ax)
 ax.set_xlabel("Categorie de timp")
 ax.set_ylabel("Tarif")
 st.pyplot(fig)
-st.markdown(
-    "**Interpretare:** Tarifele sunt mai mari noaptea si seara. Orele de varf probabil duc la tarife mai ridicate datorita cererii crescute.")
+st.markdown("**Interpretare:** Distribuția tarifelor este relativ similară între cele patru categorii de timp.")
+st.markdown("Noaptea pare să aibă o mediană puțin mai mare și o variabilitate ușor crescută față de celelalte intervale.")
+st.markdown("Outlierii sunt frecvenți în toate intervalele, în special tarife foarte mari (peste 20).")
+st.markdown("Dimineața și prânzul au mediane aproape identice și o distribuție destul de simetrică.")
 
 st.subheader("Relația dintre Numărul de Pasageri și Tarif")
 fig, ax = plt.subplots()
@@ -182,12 +239,15 @@ sns.boxplot(x=df["passenger_count"], y=df["fare_amount"], ax=ax)
 ax.set_xlabel("Număr de pasageri")
 ax.set_ylabel("Tarif")
 st.pyplot(fig)
-st.markdown(
-    "**Interpretare:** Nu exista o corelatie clara intre numarul de pasageri si tarif. Cursele cu 1-2 pasageri sunt predominante.")
+st.markdown(    "**Interpretare:** Nu există un trend clar care să arate că tariful crește odată cu numărul de pasageri.")
+st.markdown("Distribuția tarifelor este foarte similară între toate categoriile de număr de pasageri (0–3).")
+st.markdown("Mediana tarifelor este aproape identică pentru toate grupurile (~7–8 USD).")
+st.markdown("Outlieri există în toate grupurile, indicând curse cu tarife anormal de mici sau mari, dar aceste excepții nu par corelate cu numărul de pasageri.")
 
 st.subheader("Relația dintre Distanță și Tarif")
 fig, ax = plt.subplots()
-sns.scatterplot(x=df["distanta_km"], y=df["fare_amount"], hue=df["outlier_tarif"], palette="coolwarm", ax=ax)
+sns.scatterplot(x=eșantion_viz["distanta_km"], y=eșantion_viz["fare_amount"],
+                hue=eșantion_viz["outlier_tarif"], palette="coolwarm", alpha=0.5, ax=ax)
 ax.set_xlabel("Distanță (km)")
 ax.set_ylabel("Tarif")
 st.pyplot(fig)
@@ -201,7 +261,7 @@ ax.set_xlabel("Zi a săptămânii (0 = Luni, 6 = Duminică)")
 ax.set_ylabel("Tarif mediu")
 st.pyplot(fig)
 st.markdown(
-    "**Interpretare:** Tarifele sunt putin mai mari in mijlocul saptamanii.")
+    "**Interpretare:** Tariful mediu este aproximativ la fel in orice zi, cu o mica crestere in mijlocul saptamanii.")
 
 st.subheader("Distanța Medie pe An")
 fig, ax = plt.subplots()
@@ -219,7 +279,7 @@ ax.set_xlabel("Număr de pasageri")
 ax.set_ylabel("Tarif mediu")
 st.pyplot(fig)
 st.markdown(
-    "**Interpretare:** Cursele cu mai mult de un pasager tind sa fie putin mai scumpe.")
+    "**Interpretare:** Cursele cu mai mult de un pasager tind sa fie putin mai scumpe, posibil datorita unor altor factori precum distanta.")
 
 if aplica_indicator_evenimente:
     st.subheader("Tarif Mediu în Funcție de Evenimente Speciale")
@@ -261,168 +321,228 @@ if aplica_codificare_ciclică:
 
     fig.legend(loc='upper right')
     st.pyplot(fig)
+    st.markdown("Exista o scadere brusca a numarului de calatorii efectuate intr-o zi, in jurul orei 6 dimineata.")
+    st.markdown("Exista cresteri si scaderi bruste in intervalul 8-20, datorita orelor de varf cand lumea merge sau pleaca de la munca.")
+    st.markdown("In timpul saptamanii numarul de calatorii realizate este mai mic in timpul weekendului si in prima zi a saptamanii.")
+# ========================================
+# Hărți cu eșantion redus
+# ========================================
+with st.expander("Harti Locatii Populare", expanded=False):
+    st.subheader("Harti Locatii Populare")
+    eșantion_hărți = df.sample(min(60000, len(df)), random_state=42)
 
-st.subheader("Harti Locatii Populare")
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
 
-gdf_pickup = gpd.GeoDataFrame(
-    df,
-    geometry=gpd.points_from_xy(df.pickup_longitude, df.pickup_latitude),
-    crs='EPSG:4326'
-).to_crs(epsg=3857)
-
-gdf_pickup.plot(ax=ax1, markersize=0.1, alpha=0.5, color='blue')
-ctx.add_basemap(ax1, source=ctx.providers.CartoDB.Positron)
-ax1.set_title('Locatii Populare de Ridicare')
-ax1.set_axis_off()
-
-gdf_dropoff = gpd.GeoDataFrame(
-    df,
-    geometry=gpd.points_from_xy(df.dropoff_longitude, df.dropoff_latitude),
-    crs='EPSG:4326'
-).to_crs(epsg=3857)
-
-gdf_dropoff.plot(ax=ax2, markersize=0.1, alpha=0.5, color='red')
-ctx.add_basemap(ax2, source=ctx.providers.CartoDB.Positron)
-ax2.set_title('Locatii Populare de Lasare')
-ax2.set_axis_off()
-
-st.pyplot(fig)
-st.markdown(
-    "**Interpretare Ridicari:** Concentratia ridicarilor este mai mare in zone centrale precum aeroporturi si zone comerciale. Activitatea este intensa in zona Manhattan.")
-st.markdown(
-    "**Interpretare Lasari:** Zonele de lasare coincid partial cu cele de ridicare, cu distributie similara, sugerand cerere concentrata in aceleasi zone urbane.")
-
-
-# ====================
-# 1) CLUSTERIZARE GEOGRAFICĂ (pickup-hotspots)
-# ====================
-# după calculul coloanei 'distanta_km', imediat înainte de secțiunile de vizualizare:
-
-# 1.a. Convertim coordonatele într-un array (lat/lon în radiani)
-coords = df[['pickup_latitude', 'pickup_longitude']].to_numpy()
-coords_rad = np.radians(coords)
-
-# 1.b. Definim DBSCAN cu distanță maximă de 0.5 km și min_samples=50
-kms_per_radian = 6371.0088
-epsilon = 0.5 / kms_per_radian
-db = DBSCAN(eps=epsilon, min_samples=50, algorithm='ball_tree', metric='haversine')
-labels = db.fit_predict(coords_rad)
-
-df['pickup_cluster'] = labels
-num_clusters = len(set(labels) - {-1})
-st.markdown(f"**Hotspots pickup identificate:** {num_clusters} clustere.")
-
-# 1.c. Vizualizare pe hartă
-if st.checkbox("Arată pickup-hotspots pe hartă", value=False):
-    # filtrăm doar punctele care nu fac parte din zgomot (label != -1)
-    df_pick_clusters = df[df['pickup_cluster'] != -1].copy()
-    gdf_pick = gpd.GeoDataFrame(
-        df_pick_clusters,
-        geometry=gpd.points_from_xy(
-            df_pick_clusters['pickup_longitude'],
-            df_pick_clusters['pickup_latitude']
-        ),
+    gdf_pickup = gpd.GeoDataFrame(
+        eșantion_hărți,
+        geometry=gpd.points_from_xy(eșantion_hărți.pickup_longitude, eșantion_hărți.pickup_latitude),
         crs='EPSG:4326'
     ).to_crs(epsg=3857)
-    fig, ax = plt.subplots(figsize=(8, 8))
-    gdf_pick.plot(
-        ax=ax,
-        column='pickup_cluster',
-        categorical=True,
-        legend=True,
-        markersize=5,
-        alpha=0.6
-    )
-    ctx.add_basemap(ax, source=ctx.providers.CartoDB.Positron)
-    ax.set_axis_off()
+
+    gdf_pickup.plot(ax=ax1, markersize=0.1, alpha=0.5, color='blue')
+    ctx.add_basemap(ax1, source=ctx.providers.CartoDB.Positron)
+    ax1.set_title('Locatii Populare de Ridicare')
+    ax1.set_axis_off()
+
+    gdf_dropoff = gpd.GeoDataFrame(
+        eșantion_hărți,
+        geometry=gpd.points_from_xy(eșantion_hărți.dropoff_longitude, eșantion_hărți.dropoff_latitude),
+        crs='EPSG:4326'
+    ).to_crs(epsg=3857)
+
+    gdf_dropoff.plot(ax=ax2, markersize=0.1, alpha=0.5, color='red')
+    ctx.add_basemap(ax2, source=ctx.providers.CartoDB.Positron)
+    ax2.set_title('Locatii Populare de Lasare')
+    ax2.set_axis_off()
+
     st.pyplot(fig)
+    st.markdown(
+        "**Interpretare Ridicari:** Concentratia ridicarilor este mai mare in zone centrale precum aeroporturi si zone comerciale. Activitatea este intensa in zona Manhattan.")
+    st.markdown(
+        "**Interpretare Lasari:** Zonele de lasare coincid partial cu cele de ridicare, cu distributie similara, sugerand cerere concentrata in aceleasi zone urbane.")
 
+# ========================================
+# Clusterizare geografică
+# ========================================
+with st.expander("Clusterizare Geografică", expanded=False):
+    st.subheader("Clusterizare Geografică")
 
-from sklearn.linear_model import LinearRegression
-import pickle
-import os
-# ====================
-# 2) REGRESIE: PREDICȚIA TARIFULUI
-# ====================
-# Încărcare date
-# === Sidebar: configurare regresie ===
-# === 1) Preprocesare și definire caracteristici ===
-df_reg = df[~df["outlier_tarif"]].copy()
-df_reg["ora"]         = df_reg["pickup_datetime"].dt.hour
-df_reg["zi_saptamana"]= df_reg["pickup_datetime"].dt.dayofweek
-df_reg["ora_sin"]     = np.sin(2 * np.pi * df_reg["ora"] / 24)
-df_reg["ora_cos"]     = np.cos(2 * np.pi * df_reg["ora"] / 24)
-df_reg["zi_sin"]      = np.sin(2 * np.pi * df_reg["zi_saptamana"] / 7)
-df_reg["zi_cos"]      = np.cos(2 * np.pi * df_reg["zi_saptamana"] / 7)
+    # Eșantion pentru clusterizare
+    eșantion_cluster = df.sample(min(20000, len(df)), random_state=42)
 
-# Lista de caracteristici de bază
-features = ["distanta_km", "ora_sin", "ora_cos", "zi_sin", "zi_cos", "passenger_count"]
-# One-hot encoding pentru eveniment_special
-if "eveniment_special" in df_reg.columns:
-    df_reg = pd.get_dummies(df_reg, columns=["eveniment_special"], drop_first=True)
-    ev_cols = [c for c in df_reg.columns if c.startswith("eveniment_special_")]
-    features += ev_cols
+    # 1.a. Convertim coordonatele
+    coords = eșantion_cluster[['pickup_latitude', 'pickup_longitude']].to_numpy()
+    coords_rad = np.radians(coords)
 
-X = df_reg[features]
-y = df_reg["fare_amount"]
+    # 1.b. Definim DBSCAN
+    kms_per_radian = 6371.0088
+    epsilon = 0.5 / kms_per_radian
+    db = DBSCAN(eps=epsilon, min_samples=50, algorithm='ball_tree', metric='haversine')
+    labels = db.fit_predict(coords_rad)
 
-# === 2) Sidebar și persistență model ===
-st.sidebar.markdown("## Regresie Tarif Uber")
-retrain = st.sidebar.button("Începe regresia")
-model_path = "model_rf.pkl"
+    eșantion_cluster['pickup_cluster'] = labels
+    num_clusters = len(set(labels) - {-1})
+    st.markdown(f"**Hotspots pickup identificate:** {num_clusters} clustere.")
 
-if os.path.exists(model_path) and not retrain:
-    # Încarcă modelul existent
-    with open(model_path, "rb") as f:
-        lr = pickle.load(f)
-    st.sidebar.success("Model LinearRegression încărcat din disk.")
-else:
-    # Split train/test
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-    # Antrenare
-    lr = LinearRegression()
-    lr.fit(X_train, y_train)
-    # Evaluare
-    y_pred = lr.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    st.sidebar.write(f"RMSE pe test set: {rmse:.3f}")
-    # Salvare model
-    with open(model_path, "wb") as f:
-        pickle.dump(lr, f)
-    st.sidebar.success(f"Model antrenat și salvat în '{model_path}'")
+    # 1.c. Vizualizare pe hartă
+    if st.checkbox("Arată pickup-hotspots pe hartă", value=False):
+        df_pick_clusters = eșantion_cluster[eșantion_cluster['pickup_cluster'] != -1].copy()
 
-# === 3) Interfața de predicție ===
-st.sidebar.markdown("### Predicție Tarif")
-input_dist  = st.sidebar.number_input("Distanță (km)",    min_value=0.0, value=1.0, step=0.1)
-input_hour  = st.sidebar.slider("Ora zilei",             0, 23, 12)
-input_pass  = st.sidebar.number_input("Număr pasageri",   1, 6, 1)
-# Pentru simplitate, presupunem Luni (0)
-input_day   = 0
+        if not df_pick_clusters.empty:
+            gdf_pick = gpd.GeoDataFrame(
+                df_pick_clusters,
+                geometry=gpd.points_from_xy(
+                    df_pick_clusters['pickup_longitude'],
+                    df_pick_clusters['pickup_latitude']
+                ),
+                crs='EPSG:4326'
+            ).to_crs(epsg=3857)
 
-# Codificare ciclică pentru input
-sin_h = np.sin(2 * np.pi * input_hour / 24)
-cos_h = np.cos(2 * np.pi * input_hour / 24)
-sin_d = np.sin(2 * np.pi * input_day   / 7)
-cos_d = np.cos(2 * np.pi * input_day   / 7)
+            fig, ax = plt.subplots(figsize=(8, 8))
+            gdf_pick.plot(
+                ax=ax,
+                column='pickup_cluster',
+                categorical=True,
+                legend=True,
+                markersize=5,
+                alpha=0.6
+            )
+            ctx.add_basemap(ax, source=ctx.providers.CartoDB.Positron)
+            ax.set_axis_off()
+            st.pyplot(fig)
+        else:
+            st.warning("Nu s-au găsit clustere pentru afișare")
 
-# Construim DataFrame-ul de intrare
-df_user = pd.DataFrame([{
-    "distanta_km":    input_dist,
-    "ora_sin":        sin_h,
-    "ora_cos":        cos_h,
-    "zi_sin":         sin_d,
-    "zi_cos":         cos_d,
-    "passenger_count": input_pass
-}])
+# ========================================
+# Regresie pentru predicție tarif (versiune îmbunătățită)
+# ========================================
+with st.expander("Regresie Tarif", expanded=False):
+    st.sidebar.markdown("## Regresie Tarif Uber")
+    retrain = st.sidebar.button("Reantrenează modelul")
+    model_path = "model_ridge.pkl"  # Schimbăm la Ridge pentru stabilitate
 
-# Ne asigurăm că avem exact coloanele din features
-df_user = df_user.reindex(columns=features, fill_value=0.0)
+    # Pregătesc date pentru regresie
+    df_reg = df[~df["outlier_tarif"]].copy()
 
-if st.sidebar.button("Calculează tarif estimat"):
-    pred = lr.predict(df_user)[0]
-    st.sidebar.success(f"Tarif estimat: {pred:.2f} USD")
+    # Extrage caracteristici temporale
+    df_reg["ora"] = df_reg["pickup_datetime"].dt.hour
+    df_reg["zi_saptamana"] = df_reg["pickup_datetime"].dt.dayofweek
+
+    # Crează caracteristici ciclice dacă nu sunt deja create
+    if aplica_codificare_ciclică:
+        # Folosim direct coloanele existente dacă sunt disponibile
+        if "ora_sin" not in df_reg.columns:
+            df_reg["ora_sin"] = np.sin(2 * np.pi * df_reg["ora"] / 24)
+            df_reg["ora_cos"] = np.cos(2 * np.pi * df_reg["ora"] / 24)
+        if "zi_sin" not in df_reg.columns:
+            df_reg["zi_sin"] = np.sin(2 * np.pi * df_reg["zi_saptamana"] / 7)
+            df_reg["zi_cos"] = np.cos(2 * np.pi * df_reg["zi_saptamana"] / 7)
+    else:
+        # Crează caracteristici ciclice doar pentru regresie
+        df_reg["ora_sin"] = np.sin(2 * np.pi * df_reg["ora"] / 24)
+        df_reg["ora_cos"] = np.cos(2 * np.pi * df_reg["ora"] / 24)
+        df_reg["zi_sin"] = np.sin(2 * np.pi * df_reg["zi_saptamana"] / 7)
+        df_reg["zi_cos"] = np.cos(2 * np.pi * df_reg["zi_saptamana"] / 7)
+
+    # Caracteristici de bază
+    features = ["distanta_km", "passenger_count", "ora_sin", "ora_cos", "zi_sin", "zi_cos"]
+
+    # One-hot encoding pentru evenimente speciale
+    if aplica_indicator_evenimente and "eveniment_special" in df_reg.columns:
+        df_reg = pd.get_dummies(df_reg, columns=["eveniment_special"], drop_first=True)
+        ev_cols = [c for c in df_reg.columns if c.startswith("eveniment_special_")]
+        features += ev_cols
+
+    # Eșantion pentru antrenament
+    eșantion_regresie = df_reg.sample(min(50000, len(df_reg)), random_state=42)
+    X = eșantion_regresie[features]
+    y = eșantion_regresie["fare_amount"]
+
+    # Scalare caracteristici
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Antrenare sau încărcare model
+    if os.path.exists(model_path) and not retrain:
+        with open(model_path, "rb") as f:
+            model, scaler_state = pickle.load(f)
+            # Reconstruim scalerul cu starea salvată
+            scaler = StandardScaler()
+            scaler.mean_ = scaler_state['mean']
+            scaler.scale_ = scaler_state['scale']
+        st.sidebar.success("Model Ridge încărcat din disk.")
+    else:
+        from sklearn.linear_model import Ridge  # Schimbăm la Ridge pentru stabilitate
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_scaled, y, test_size=0.2, random_state=42
+        )
+
+        # Folosim Ridge Regression pentru stabilitate numerică
+        model = Ridge(alpha=1.0)  # Model liniar stabil
+        model.fit(X_train, y_train)
+
+        y_pred = model.predict(X_test)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        st.sidebar.write(f"RMSE pe set de test: {rmse:.3f}")
+
+        # Salvăm modelul și starea scalerului
+        scaler_state = {
+            'mean': scaler.mean_,
+            'scale': scaler.scale_
+        }
+        with open(model_path, "wb") as f:
+            pickle.dump((model, scaler_state), f)
+        st.sidebar.success(f"Model antrenat și salvat în '{model_path}'")
+
+    # Interfață predicție
+    st.sidebar.markdown("### Predicție Tarif")
+
+    # Folosim coloane pentru a organiza mai bine input-urile
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        input_dist = st.number_input("Distanță (km)", min_value=0.1, value=3.5, step=0.1)
+        input_pass = st.number_input("Număr pasageri", 1, 6, 2)
+    with col2:
+        input_hour = st.slider("Ora zilei", 0, 23, 5)
+        input_day = st.slider("Ziua săptămânii (0=Luni)", 0, 6, 4)  # 4 = Vineri
+
+    # Codificare ciclică pentru input
+    sin_h = np.sin(2 * np.pi * input_hour / 24)
+    cos_h = np.cos(2 * np.pi * input_hour / 24)
+    sin_d = np.sin(2 * np.pi * input_day / 7)
+    cos_d = np.cos(2 * np.pi * input_day / 7)
+
+    # Construire date de intrare
+    date_intrare = {
+        "distanta_km": input_dist,
+        "passenger_count": input_pass,
+        "ora_sin": sin_h,
+        "ora_cos": cos_h,
+        "zi_sin": sin_d,
+        "zi_cos": cos_d
+    }
+
+    # Adăugăm coloane pentru evenimente speciale dacă sunt necesare
+    if aplica_indicator_evenimente and "eveniment_special" in df_reg.columns:
+        for col in [c for c in df_reg.columns if c.startswith("eveniment_special_")]:
+            date_intrare[col] = 0
+
+    # Cream DataFrame-ul pentru predicție
+    df_user = pd.DataFrame([date_intrare])
+    df_user = df_user.reindex(columns=features, fill_value=0.0)
+
+    # Scalăm datele de intrare
+    X_user = scaler.transform(df_user)
+
+    if st.sidebar.button("Calculează tarif estimat", key="predict_button"):
+        pred = model.predict(X_user)[0]
+        # Verificăm dacă am aplicat transformare logaritmică
+        if metoda_extreme == "Transformare logaritmică":
+            pred = np.expm1(pred)  # Transformare inversă
+
+        st.sidebar.success(f"Tarif estimat: ${pred:.2f} USD")
+
+st.markdown("---")
 st.markdown(
     "Aplicația utilizează Streamlit pentru afișare și analize diverse, împreună cu pandas pentru prelucrarea datelor și Matplotlib/Seaborn pentru reprezentările grafice.")
